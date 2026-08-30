@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class ConfidenceMethodConstants:
-    NAMES = ("max_prob", "entropy")
+    NAMES = ("max_prob", "entropy", "margin", "max_prob_raw")
     ENTROPY_TYPES = ("gibbs", "tsallis", "renyi")
     ENTROPY_NORMS = ("lin", "exp")
 
@@ -55,6 +55,8 @@ class ConfidenceMethodConfig:
         name: The method name (str).
             Supported values:
                 - 'max_prob' for using the maximum token probability as a confidence.
+                - 'max_prob_raw' for the raw softmax probability (no V-normalization).
+                - 'margin' for the difference between top-2 probabilities (p_max - p_second).
                 - 'entropy' for using a normalized entropy of a log-likelihood vector.
 
         entropy_type: Which type of entropy to use (str).
@@ -236,6 +238,14 @@ def get_confidence_measure_bank():
         if t == 1.0
         else ((x.max(dim=-1)[0] * t).exp() * math.pow(v, t) - 1) / (math.pow(v, t) - 1)
     )
+    # margin: p_max - p_second (top-2 gap, no V-normalization)
+    confidence_measure_bank["margin"] = lambda x, v, t: (
+        x.topk(2, dim=-1)[0][:, :, 0].exp() - x.topk(2, dim=-1)[0][:, :, 1].exp()
+    )
+    # max_prob_raw: raw softmax probability (no V-normalization)
+    confidence_measure_bank["max_prob_raw"] = lambda x, v, t: (
+        x.max(dim=-1)[0].exp() if t == 1.0 else (x.max(dim=-1)[0] * t).exp()
+    )
     confidence_measure_bank["entropy_gibbs_lin"] = lambda x, v, t: (
         entropy_gibbs_lin_baseline(x, v)
         if t == 1.0
@@ -312,6 +322,10 @@ class ConfidenceMethodMixin(ABC):
         measure_name = ""
         if confidence_method_cfg.name == "max_prob":
             measure_name = "max_prob"
+        elif confidence_method_cfg.name == "max_prob_raw":
+            measure_name = "max_prob_raw"
+        elif confidence_method_cfg.name == "margin":
+            measure_name = "margin"
         elif confidence_method_cfg.name == "entropy":
             measure_name = '_'.join(
                 [confidence_method_cfg.name, confidence_method_cfg.entropy_type, confidence_method_cfg.entropy_norm]
