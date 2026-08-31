@@ -267,13 +267,14 @@ def get_confidence_measure_bank():
         entropy_gibbs_exp_baseline(x, v) if t == 1.0 else (neg_entropy_alpha(x, t).pow(1 / (t - 1)) * v - 1) / (v - 1)
     )
     # top3_mass: sum of top-3 softmax probabilities, in [0, 1]
-    confidence_measure_bank["top3_mass"] = lambda x, v, t: (
-        torch.softmax(x * t, dim=-1).topk(3, dim=-1)[0].sum(-1)
-    )
+    confidence_measure_bank["top3_mass"] = lambda x, v, t: (torch.softmax(x * t, dim=-1).topk(3, dim=-1)[0].sum(-1))
     # entropy: 1 - H(p)/log(V), normalized Shannon entropy confidence in [0, 1]
     confidence_measure_bank["entropy"] = lambda x, v, t: (
-        1.0 + (torch.nn.functional.log_softmax(x * t, dim=-1).exp()
-               * torch.nn.functional.log_softmax(x * t, dim=-1)).sum(-1) / math.log(v)
+        1.0
+        + (torch.nn.functional.log_softmax(x * t, dim=-1).exp() * torch.nn.functional.log_softmax(x * t, dim=-1)).sum(
+            -1
+        )
+        / math.log(v)
     )
     return confidence_measure_bank
 
