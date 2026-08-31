@@ -29,16 +29,30 @@ from nemo.collections.asr.inference.pipelines.base_pipeline import BasePipeline
 from nemo.collections.asr.inference.streaming.decoders.greedy.greedy_rnnt_decoder import RNNTGreedyDecoder
 from nemo.collections.asr.inference.streaming.endpointing.greedy.greedy_rnnt_endpointing import RNNTGreedyEndpointing
 from nemo.collections.asr.inference.streaming.framing.multi_stream import ContinuousBatchedRequestStreamer
-from nemo.collections.asr.inference.streaming.framing.request import FeatureBuffer, Frame
+from nemo.collections.asr.inference.streaming.framing.request import FeatureBuffer, Frame, Request
 from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
-from nemo.collections.asr.inference.streaming.state.cache_aware_rnnt_state import CacheAwareRNNTStreamingState
+from nemo.collections.asr.inference.streaming.state.cache_aware_rnnt_state import (
+    CacheAwareRNNTBeamStreamingState,
+    CacheAwareRNNTStreamingState,
+)
 from nemo.collections.asr.inference.utils.endpointing_utils import millisecond_to_frames
 from nemo.collections.asr.inference.utils.enums import RequestType
+from nemo.collections.asr.inference.utils.per_stream_biasing import (
+    build_multi_biasing_ids_np,
+    release_all_biasing_models,
+    release_auto_managed_stream_biasing,
+)
 from nemo.collections.asr.inference.utils.pipeline_utils import (
     check_existance_of_required_attributes,
+    drop_trailing_features,
+    filter_token_sequences,
+    filter_token_triples,
+    filter_tokens_from_greedy_output,
     get_confidence_utils,
 )
+from nemo.collections.asr.parts.submodules.rnnt_malsd_batched_computer import ModifiedALSDBatchedRNNTComputer
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.utils import logging
 
 if TYPE_CHECKING:
     from nemo.collections.asr.inference.itn.inverse_normalizer import AlignmentPreservingInverseNormalizer
@@ -74,7 +88,25 @@ class CacheAwareRNNTPipeline(BasePipeline):
         self.init_endpointer()
         self.init_text_processor(cfg, itn_model)
         self.init_nmt_model(nmt_model)
+        self.init_decoding_computer()
         super().__init__()
+
+    def init_decoding_computer(self) -> None:
+        """Initialize ``decoding_computer``."""
+        self.decoding_computer = None
+        asr_model = getattr(self.asr_model, "asr_model", None)
+        if asr_model is None:
+            return
+        decoding = getattr(getattr(asr_model, "decoding", None), "decoding", None)
+        if decoding is not None:
+            self.decoding_computer = getattr(decoding, "decoding_computer", None)
+
+    @property
+    def beam_decoder_computer(self) -> ModifiedALSDBatchedRNNTComputer | None:
+        """Return ``decoding_computer`` when beam-search decoding is active."""
+        if isinstance(self.decoding_computer, ModifiedALSDBatchedRNNTComputer):
+            return self.decoding_computer
+        return None
 
     def init_parameters(self, cfg: DictConfig) -> None:
         """
@@ -84,6 +116,15 @@ class CacheAwareRNNTPipeline(BasePipeline):
         """
         if cfg.streaming.att_context_size is not None:
             self.asr_model.set_default_att_context_size(att_context_size=cfg.streaming.att_context_size)
+
+        # Language prompt for multilingual models, taken from the top-level `lang` field.
+        self.strip_lang_tags = cfg.asr.get("strip_lang_tags", True)
+        if self.prompt_enabled:
+            self.default_language_code = cfg.get("lang", None) or self._resolve_default_language_code()
+            logging.info(f"Multilingual ASR model: conditioning on language '{self.default_language_code}'.")
+        else:
+            self.default_language_code = None
+        self.language_token_sequences = self._build_language_token_sequences()
 
         self.sample_rate = cfg.streaming.sample_rate
         self.asr_output_granularity = cfg.asr_output_granularity
@@ -137,14 +178,15 @@ class CacheAwareRNNTPipeline(BasePipeline):
             self.drop_left_context = left_context_size
             self.valid_out_len = self.tokens_per_frame
 
+        # Expected feature buffer length for trimming (safeguard for feature buffer inputs)
+        self.expected_feature_buffer_len = int(self.buffer_size_in_secs / self.window_stride)
+
         self.stop_history_eou_in_milliseconds = cfg.endpointing.stop_history_eou
         self.residue_tokens_at_end = cfg.endpointing.residue_tokens_at_end
         self.word_boundary_tolerance = cfg.streaming.word_boundary_tolerance
         self.return_tail_result = cfg.return_tail_result
 
         self.request_type = RequestType.from_str(cfg.streaming.request_type)
-        if self.request_type is not RequestType.FRAME:
-            raise ValueError(f"Request type {self.request_type} is not supported for cache-aware streaming.")
 
     def init_greedy_rnnt_decoder(self) -> None:
         """Initialize the RNNT decoder."""
@@ -178,17 +220,20 @@ class CacheAwareRNNTPipeline(BasePipeline):
         Returns:
             (CacheAwareRNNTStreamingState) New empty state.
         """
-        state = CacheAwareRNNTStreamingState()
+        state = (
+            CacheAwareRNNTBeamStreamingState()
+            if self.beam_decoder_computer is not None
+            else CacheAwareRNNTStreamingState()
+        )
         state.set_global_offset(0)
-        new_options = options.augment_with_defaults(
-            default_enable_itn=self.text_processor.is_itn_enabled(),
-            default_enable_pnc=self.text_processor.is_pnc_enabled(),
+        new_options = options.fill_defaults(
+            default_enable_itn=self.text_processor.itn_enabled,
             default_enable_nmt=self.nmt_enabled,
             default_source_language=self.nmt_model.source_language if self.nmt_enabled else None,
             default_target_language=self.nmt_model.target_language if self.nmt_enabled else None,
             default_stop_history_eou=self.stop_history_eou_in_milliseconds,
             default_asr_output_granularity=self.asr_output_granularity,
-            default_language_code="en-US" if self.prompt_enabled else None,
+            default_language_code=self.default_language_code,
         )
 
         eou_label_buffer_size = 0
@@ -211,6 +256,12 @@ class CacheAwareRNNTPipeline(BasePipeline):
 
         return state
 
+    def close_session(self) -> None:
+        """Close the session and release per-stream biasing models held in the decoder."""
+        if self.decoding_computer is not None and self.decoding_computer.per_stream_biasing_enabled:
+            release_all_biasing_models(self.decoding_computer.biasing_multi_model, self._state_pool.values())
+        super().close_session()
+
     def get_sep(self) -> str:
         """Return the separator for the text processor."""
         return self.sep
@@ -225,6 +276,10 @@ class CacheAwareRNNTPipeline(BasePipeline):
             (tuple[Tensor, Tensor]) Processed feature buffers and their lengths.
         """
         feature_buffers = [f_buffer.unsqueeze_(0) for f_buffer in buffers]
+        # Trim to expected feature buffer length (safeguard for external feature buffer inputs)
+        feature_buffers = [
+            drop_trailing_features(f_buffer, self.expected_feature_buffer_len) for f_buffer in feature_buffers
+        ]
         feature_buffer_lens = torch.tensor([f_buffer.shape[2] for f_buffer in feature_buffers], device=self.device)
         if right_paddings is not None:
             right_paddings = torch.tensor(right_paddings, device=feature_buffer_lens.device)
@@ -232,24 +287,123 @@ class CacheAwareRNNTPipeline(BasePipeline):
         feature_buffers = torch.cat(feature_buffers).to(self.device)
         return feature_buffers, feature_buffer_lens
 
-    def run_greedy_decoder(self, state: CacheAwareRNNTStreamingState, frame: Frame, hyp: Hypothesis) -> bool:
+    def _streaming_step(
+        self,
+        states: list[CacheAwareRNNTStreamingState],
+        feature_buffers: Tensor,
+        feature_buffer_lens: Tensor,
+        context,
+        previous_hypotheses: list[Hypothesis | None],
+        drop_extra_pre_encoded: int,
+        keep_all_outputs: bool,
+        prompt_vectors: Tensor | None,
+    ) -> tuple[list[Hypothesis], object]:
+        """
+        Run one cache-aware encode/decode step for the current chunk.
+        Returns per-stream hypotheses and the updated encoder cache context.
+        """
+        if self.beam_decoder_computer is None:
+            return self.asr_model.stream_step(
+                processed_signal=feature_buffers,
+                processed_signal_length=feature_buffer_lens,
+                context=context,
+                previous_hypotheses=previous_hypotheses,
+                drop_extra_pre_encoded=drop_extra_pre_encoded,
+                keep_all_outputs=keep_all_outputs,
+                drop_left_context=self.drop_left_context,
+                valid_out_len=self.valid_out_len,
+                prompt_vectors=prompt_vectors,
+            )
+        return self.asr_model.malsd_stream_step(
+            malsd_computer=self.beam_decoder_computer,
+            states=states,
+            processed_signal=feature_buffers,
+            processed_signal_length=feature_buffer_lens,
+            context=context,
+            drop_extra_pre_encoded=drop_extra_pre_encoded,
+            keep_all_outputs=keep_all_outputs,
+            drop_left_context=self.drop_left_context,
+            valid_out_len=self.valid_out_len,
+            prompt_vectors=prompt_vectors,
+        )
+
+    def _prepare_per_stream_biasing(
+        self,
+        states: list[CacheAwareRNNTStreamingState],
+        previous_hypotheses: list[Hypothesis | None],
+    ) -> list[Hypothesis | None]:
+        if self.decoding_computer is None or not self.decoding_computer.per_stream_biasing_enabled:
+            if any(state.has_biasing_request() for state in states):
+                logging.warning(
+                    "Biasing request is not empty, but decoder does not support per-stream biasing. Skipping"
+                )
+            return previous_hypotheses
+
+        multi_biasing_ids_np = build_multi_biasing_ids_np(
+            states,
+            self.decoding_computer.biasing_multi_model,
+            self.asr_model.tokenizer,
+        )
+
+        if self.beam_decoder_computer is not None:
+            return previous_hypotheses
+
+        for i, (state, previous_hyp) in enumerate(zip(states, previous_hypotheses)):
+            if multi_biasing_ids_np[i] < 0:
+                continue
+            biasing_cfg = state.options.biasing_cfg
+            if previous_hyp is None:
+                previous_hypotheses[i] = Hypothesis.empty_with_biasing_cfg(biasing_cfg)
+            else:
+                previous_hyp.biasing_cfg = biasing_cfg
+        return previous_hypotheses
+
+    def _apply_beam_update_(self, state: CacheAwareRNNTBeamStreamingState, eou_detected: bool) -> None:
+        """After endpointing: refresh beam publish tokens and fold cumulative prefix on EOU."""
+        if eou_detected and state.hyp_decoding_state is not None:
+            beam_idx = state.select_best_beam_idx_(score_norm=True)
+            self.beam_decoder_computer.select_beam_in_state_item_(state.hyp_decoding_state, beam_idx)
+        state.update_(eou_detected)
+
+        if self._lang_tag_filtering_enabled() and state.tokens:
+            # ``update_`` rebuilds the tokens from the raw beam stream, so language tags reappear here.
+            state.tokens, state.timesteps, state.confidences = filter_token_triples(
+                state.tokens, state.timesteps, state.confidences, self.language_token_ids
+            )
+            state.tokens, state.timesteps, state.confidences = filter_token_sequences(
+                state.tokens, state.timesteps, state.confidences, self.language_token_sequences
+            )
+            state.last_token = state.tokens[-1] if state.tokens else None
+            state.last_token_idx = state.timesteps[-1] if state.timesteps else None
+
+    def run_greedy_decoder(self, state: CacheAwareRNNTStreamingState, request: Request, hyp: Hypothesis) -> bool:
         """
         Run the greedy RNNT decoder on the hypothesis and update the state
         Args:
             state: (CacheAwareRNNTStreamingState) The state of the stream
-            frame: (Frame) The current frame
-            hyp: (Hypothesis) The hypothesis of the current frame
+            request: (Request) The current request (frame or feature buffer)
+            hyp: (Hypothesis) The hypothesis of the current request
         Returns:
             (bool) Whether EOU is detected.
         """
-        eou_detected = frame.is_last
+        eou_detected = request.is_last
+        # Per-token non-blank confidence precomputed during RNN-T decoding (aligned with `hyp.y_sequence`).
+        # Populated when greedy or batched-beam preserve_frame_confidence is enabled; otherwise None.
         cur_output, cur_labels, new_offset = self.greedy_rnnt_decoder(
             global_timestamps=hyp.timestamp,
             tokens=hyp.y_sequence,
             length=self.tokens_per_frame,
             offset=state.offset,
+            confidences=hyp.non_blank_step_confidence_precomputed,
         )
         state.set_offset(new_offset)
+
+        if self._lang_tag_filtering_enabled():
+            # Drop language tags (e.g. <en-US>) so they are excluded from the transcript
+            # and are not counted as speech for EOU detection.
+            cur_output, cur_labels = filter_tokens_from_greedy_output(
+                cur_output, cur_labels, self.language_token_ids, self.blank_id, self.language_token_sequences
+            )
 
         # cur labels contains blank tokens as well, it is needed for EOU detection
         state.update_label_buffer(cur_labels)
@@ -266,7 +420,7 @@ class CacheAwareRNNTPipeline(BasePipeline):
 
     def cache_aware_transcribe_step(
         self,
-        frames: list[Frame],
+        requests: list[Request],
         features: list[Tensor],
         right_paddings: list[int],
         ready_state_ids: set,
@@ -274,7 +428,7 @@ class CacheAwareRNNTPipeline(BasePipeline):
     ) -> None:
         """
         Cache Aware Transcribe Step
-        It receives a list of frames and features and do the following:
+        It receives a list of requests (Frame or FeatureBuffer) and features and do the following:
 
         1. Preprocess the features by stacking them and computing the lengths
         2. Collecting previous hypotheses for stateful decoding
@@ -285,7 +439,7 @@ class CacheAwareRNNTPipeline(BasePipeline):
         7. Perform greedy RNNT decoding to get the best hypothesis and update the states
         8. Update the ready states to indicate that the state is ready for text post-processing
         Args:
-            frames: (list[Frame]) List of frames to transcribe.
+            requests: (list[Request]) List of requests (frames or feature buffers) to transcribe.
             features: (list[Tensor]) List of feature buffers.
             right_paddings: (list[int] | None) List of right paddings.
             ready_state_ids: (set) Set of ready state IDs.
@@ -294,12 +448,18 @@ class CacheAwareRNNTPipeline(BasePipeline):
 
         feature_buffers, feature_buffer_lens = self.preprocess(features, right_paddings)
         states, stream_ids, eos_flags = [], [], []
-        for frame in frames:
-            states.append(self.get_state(frame.stream_id))
-            stream_ids.append(frame.stream_id)
-            eos_flags.append(frame.is_last)
+        for request in requests:
+            states.append(self.get_state(request.stream_id))
+            stream_ids.append(request.stream_id)
+            eos_flags.append(request.is_last)
 
         previous_hypotheses = [state.get_previous_hypothesis() for state in states]
+
+        previous_hypotheses = self._prepare_per_stream_biasing(
+            states=states,
+            previous_hypotheses=previous_hypotheses,
+        )
+
         context, mapping = self.context_manager.get_context(stream_ids)
 
         prompt_vectors = None
@@ -307,15 +467,14 @@ class CacheAwareRNNTPipeline(BasePipeline):
             prompt_vectors = self._build_prompt_vectors(states)
 
         drop_extra_pre_encoded = 0 if not self.use_cache else self.asr_model.drop_extra_pre_encoded
-        best_hyp, new_context = self.asr_model.stream_step(
-            processed_signal=feature_buffers,
-            processed_signal_length=feature_buffer_lens,
+        best_hyp, new_context = self._streaming_step(
+            states=states,
+            feature_buffers=feature_buffers,
+            feature_buffer_lens=feature_buffer_lens,
             context=context,
             previous_hypotheses=previous_hypotheses,
             drop_extra_pre_encoded=drop_extra_pre_encoded,
             keep_all_outputs=keep_all_outputs,
-            drop_left_context=self.drop_left_context,
-            valid_out_len=self.valid_out_len,
             prompt_vectors=prompt_vectors,
         )
 
@@ -330,17 +489,69 @@ class CacheAwareRNNTPipeline(BasePipeline):
             else:
                 state.set_previous_hypothesis(hyp)
 
-        # run greedy decoder for each frame-state-hypothesis tuple
-        for frame, state, hyp in zip(frames, states, best_hyp):
-            eou_detected = self.run_greedy_decoder(state, frame, hyp)
+        # run greedy decoder for each request-state-hypothesis tuple
+        for request, state, hyp in zip(requests, states, best_hyp):
+            eou_detected = self.run_greedy_decoder(state, request, hyp)
+            if self.beam_decoder_computer is not None:
+                self._apply_beam_update_(state, eou_detected)
             if eou_detected:
                 self.bpe_decoder.decode_bpe_tokens(state)
                 state.cleanup_after_eou()
-                ready_state_ids.add(frame.stream_id)
+                ready_state_ids.add(request.stream_id)
+
+        # Cleanup per-stream biasing models when stream ends
+        if self.decoding_computer is not None and self.decoding_computer.per_stream_biasing_enabled:
+            for request, state in zip(requests, states):
+                # only the first request contains biasing options; biasing options for the stream are stored in state
+                if request.is_last and state.has_biasing_request():
+                    release_auto_managed_stream_biasing(state, self.decoding_computer.biasing_multi_model)
+
+        if self.beam_decoder_computer is not None:
+            for state, eos in zip(states, eos_flags):
+                if eos:
+                    state.reset_beam_decoding_state_()
 
     def transcribe_step_for_feature_buffers(self, fbuffers: list[FeatureBuffer]) -> None:
-        """Transcribe a step for feature buffers"""
-        raise NotImplementedError("Feature buffer type is not supported for cache aware streaming.")
+        """
+        Transcribes the feature buffers in a streaming manner.
+        After detecting EOU, it updates the state and run text processor.
+        If there are multiple streams, it waits until all states are ready to run text processor.
+        Args:
+            fbuffers: (list[FeatureBuffer]) List of feature buffers to transcribe.
+        """
+        ready_state_ids = set()
+
+        final_fbuffers, final_features = [], []
+        nonfinal_fbuffers, nonfinal_features = [], []
+        final_right_paddings = []
+
+        for fbuffer in fbuffers:
+            feature = fbuffer.features
+            right_padding = max(0, self.expected_feature_buffer_len - fbuffer.valid_size)
+
+            if fbuffer.is_last:
+                final_fbuffers.append(fbuffer)
+                final_features.append(feature)
+                final_right_paddings.append(right_padding)
+            else:
+                nonfinal_fbuffers.append(fbuffer)
+                nonfinal_features.append(feature)
+
+        if len(nonfinal_fbuffers) > 0:
+            self.cache_aware_transcribe_step(
+                nonfinal_fbuffers, nonfinal_features, None, ready_state_ids, keep_all_outputs=False
+            )
+
+        if len(final_fbuffers) > 0:
+            self.cache_aware_transcribe_step(
+                final_fbuffers, final_features, final_right_paddings, ready_state_ids, keep_all_outputs=True
+            )
+
+        if len(ready_state_ids) > 0:
+            self.text_processor.process([self.get_state(stream_id) for stream_id in ready_state_ids])
+            ready_state_ids.clear()
+
+        self.update_partial_transcript(fbuffers, self.tokenizer, self.leading_regex_pattern)
 
     def transcribe_step_for_frames(self, frames: list[Frame]) -> None:
         """
@@ -359,6 +570,7 @@ class CacheAwareRNNTPipeline(BasePipeline):
             final_frames, final_fbuffers = [], []
             nonfinal_frames, nonfinal_fbuffers = [], []
             final_right_paddings = []
+
             for jdx, bfeature in enumerate(all_fbuffers):
                 bframe = frames[jdx]
 
@@ -400,9 +612,42 @@ class CacheAwareRNNTPipeline(BasePipeline):
             sample_rate=self.sample_rate,
             batch_size=self.batch_size,
             request_type=self.request_type,
-            preprocessor=None,
-            buffer_size_in_secs=None,
-            device=None,
+            preprocessor=self.preprocessor,
+            buffer_size_in_secs=self.buffer_size_in_secs,
+            device=self.device,
             pad_last_frame=True,
         )
         return request_generator
+
+    def _build_language_token_sequences(self) -> tuple[tuple[int, ...], ...]:
+        """
+        Token id sequences for language tags that are not single vocabulary tokens.
+
+        Locales such as ``mt-MT`` and ``sl-SI`` have no dedicated vocabulary token, so the model
+        spells the tag out from sub-word pieces and ``language_token_ids`` cannot match it.
+        Returns:
+            (tuple[tuple[int, ...], ...]) Token id sequences, longest first.
+        """
+        if not self.prompt_enabled or not self.strip_lang_tags:
+            return ()
+
+        vocabulary = set(self.vocabulary)
+        sequences = set()
+        for language_code in self._prompt_config["prompt_dict"]:
+            tag = f"<{language_code}>"
+            if tag in vocabulary:
+                continue  # already covered by `language_token_ids`
+            token_ids = self.tokenizer.text_to_ids(tag)
+            if len(token_ids) > 1:
+                sequences.add(tuple(token_ids))
+                # the leading SentencePiece underscore is absent when the tag is not space-preceded
+                sequences.add(tuple(token_ids[1:]))
+        return tuple(sorted(sequences, key=len, reverse=True))
+
+    def _lang_tag_filtering_enabled(self) -> bool:
+        """
+        Whether language tags should be stripped from the decoded output.
+        Returns:
+            (bool) True if the model is prompt-conditioned, stripping is on and the vocabulary has language tokens.
+        """
+        return bool(self.prompt_enabled and self.strip_lang_tags and self.language_token_ids)

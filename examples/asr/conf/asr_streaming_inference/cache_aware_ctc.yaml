@@ -6,7 +6,7 @@ asr:
   device: cuda                                                          # Device for inference: 'cuda' or 'cpu'
   device_id: 0                                                          # GPU device ID
   compute_dtype: bfloat16                                               # Compute precision: 'bfloat16' for Ampere+, 'float16' for older GPUs, or 'float32'
-  use_amp: true                                                         # Enable Automatic Mixed Precision
+  use_amp: false                                                         # Enable Automatic Mixed Precision
 
 
 # ==========================================
@@ -36,6 +36,8 @@ nmt:
   llm_params:                                        # See https://docs.vllm.ai/en/v0.8.1/api/offline_inference/llm.html for more details
     dtype: "auto"                                    # Compute precision
     seed: 42                                         # The seed to initialize the random number generator for sampling
+    gpu_memory_utilization: 0.85                     # Sets what fraction of each GPU's memory vLLM is allowed to reserve and use. Use smaller values for reducing GPU memory usage.
+    max_model_len: 4096                              # Maximum length of the model tokens.
   sampling_params:                                   # See https://docs.vllm.ai/en/v0.6.4/dev/sampling_params.html for more details
     max_tokens: 100                                  # Maximum number of tokens to generate with LLM
     temperature: 0.0                                 # LLM sampling temperature, default for translation is 0 (greedy)
@@ -75,7 +77,7 @@ streaming:
   use_cache: true                             # Whether to use cache for streaming
   use_feat_cache: true                        # Whether to cache mel-spec features, set false to re-calculate all mel-spec features in audio buffer
   chunk_size_in_secs: null                    # Amount of audio to load for each streaming step, e.g., 0.08s for FastConformer. Set to `null` for using default size equal to 1+lookahead frames.
-  request_type: frame                         # Type of request: frame, only frame is supported for cache-aware streaming
+  request_type: frame                         # Type of request: frame or feature_buffer
   num_slots: 1024                             # Number of slots in the context manager: must be >= batch_size
 
 
@@ -93,7 +95,6 @@ asr_decoding_type: ctc                        # Decoding method: ctc or rnnt
 audio_file: null                              # Path to audio file, directory, or manifest JSON
 output_filename: null                         # Path to output transcription JSON file
 output_dir: null                              # Directory to save time-aligned output
-enable_pnc: false                             # Whether to apply punctuation & capitalization
 enable_itn: false                             # Whether to apply inverse text normalization
 enable_nmt: false                             # Whether to apply neural machine translation
 asr_output_granularity: segment               # Output granularity: word or segment
@@ -102,6 +103,8 @@ lang: null                                    # Language code for ASR model
 return_tail_result: false                     # Whether to return the tail labels left in the right padded side of the buffer
 calculate_wer: true                           # Whether to calculate WER
 calculate_bleu: true                          # Whether to calculate BLEU score
+warmup_steps: 0                               # Number of warmup steps for RTFx and LAAL calculation
+run_steps: 1                                  # Number of run steps for RTFx and LAAL calculation
 
 
 # ========================

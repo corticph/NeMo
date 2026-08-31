@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from datetime import datetime
 from typing import AsyncGenerator, List, Optional
 
 from loguru import logger
@@ -24,6 +25,7 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
@@ -33,6 +35,7 @@ from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 from pydantic import BaseModel
 
+from nemo.agents.voice_agent.pipecat.services.nemo.audio_logger import AudioLogger
 from nemo.agents.voice_agent.pipecat.services.nemo.streaming_asr import NemoStreamingASRService
 
 ASR_EOU_MODELS = ["nvidia/parakeet_realtime_eou_120m-v1"]
@@ -47,7 +50,7 @@ try:
 
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
-    logger.error('In order to use NVIDIA NeMo STT, you need to `pip install "nemo_toolkit[all]"`.')
+    logger.error('In order to use NVIDIA NeMo STT, you need to `pip install "nemo-toolkit[all]"`.')
     raise Exception(f"Missing module: {e}")
 
 
@@ -68,21 +71,20 @@ class NemoSTTService(STTService):
     def __init__(
         self,
         *,
-        model: Optional[str] = "nvidia/stt_en_fastconformer_hybrid_large_streaming_multi",
+        model: Optional[str] = "nnvidia/parakeet_realtime_eou_120m-v1",
         device: Optional[str] = "cuda:0",
         sample_rate: Optional[int] = 16000,
         params: Optional[NeMoSTTInputParams] = None,
         has_turn_taking: Optional[bool] = None,  # if None, it will be set by the model name
         backend: Optional[str] = "legacy",
         decoder_type: Optional[str] = "rnnt",
+        audio_logger: Optional[AudioLogger] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-
         self._queue = asyncio.Queue()
         self._sample_rate = sample_rate
-        params.buffer_size = params.frame_len_in_secs // params.raw_audio_frame_len_in_secs
-        self._params = params
+        self._params = params or NeMoSTTInputParams()
         self._model_name = model
         if has_turn_taking is None:
             has_turn_taking = True if model in ASR_EOU_MODELS else False
@@ -90,8 +92,9 @@ class NemoSTTService(STTService):
         self._has_turn_taking = has_turn_taking
         self._backend = backend
         self._decoder_type = decoder_type
-        if not params:
-            raise ValueError("params is required")
+        self._audio_logger = audio_logger
+        self._is_vad_active = False
+        logger.info(f"NeMoSTTInputParams: {self._params}")
 
         self._device = device
 
@@ -162,8 +165,11 @@ class NemoSTTService(STTService):
         Yields:
             Frame: Transcription frames containing the results
         """
+        timestamp_now = datetime.now()
         await self.start_ttfb_metrics()
         await self.start_processing_metrics()
+        if self._audio_logger is not None and self._audio_logger.first_audio_timestamp is None:
+            self._audio_logger.first_audio_timestamp = timestamp_now
 
         try:
             is_final = False
@@ -174,9 +180,28 @@ class NemoSTTService(STTService):
                 audio = b"".join(self.audio_buffer)
                 self.audio_buffer = []
 
+                # Append to continuous user audio buffer for stereo conversation recording
+                if self._audio_logger is not None:
+                    self._audio_logger.append_continuous_user_audio(audio)
+
                 asr_result = self._model.transcribe(audio)
                 transcription = asr_result.text
                 is_final = asr_result.is_final
+                if self._audio_logger is not None:
+                    if self._is_vad_active:
+                        is_first_frame = False
+                        self._audio_logger.turn_audio_buffer.append(audio)
+                        # Accumulate transcriptions for turn-based logging
+                        if transcription:
+                            self._audio_logger.turn_transcription_buffer.append(transcription)
+                            self._audio_logger.stage_turn_audio_and_transcription(
+                                timestamp_now=timestamp_now,
+                                is_first_frame=is_first_frame,
+                                additional_metadata={
+                                    "model": self._model_name,
+                                    "backend": self._backend,
+                                },
+                            )
                 eou_latency = asr_result.eou_latency
                 eob_latency = asr_result.eob_latency
                 eou_prob = asr_result.eou_prob
@@ -210,7 +235,7 @@ class NemoSTTService(STTService):
                     frame_type = InterimTranscriptionFrame
                 else:
                     # otherwise, we use the is_final flag to determine the frame type
-                    frame_type = TranscriptionFrame if not is_final else InterimTranscriptionFrame
+                    frame_type = TranscriptionFrame if is_final else InterimTranscriptionFrame
                 await self.push_frame(
                     frame_type(
                         transcription,
@@ -284,4 +309,8 @@ class NemoSTTService(STTService):
                     "[EOU missing] STT failed to detect end of utterance before VAD detected user stopped speaking"
                 )
             self._model.reset_state()
+            self._is_vad_active = False
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            self._is_vad_active = True
+
         await super().process_frame(frame, direction)

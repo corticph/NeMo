@@ -22,6 +22,8 @@ The script performs the following steps:
     (3) Runs inference on the input audio files.
     (4) Writes the transcriptions to an output json/jsonl file. Word/Segment level output is written to a separate JSON file.
 
+For cache-aware streaming, pass ``asr.use_cuda_graphs=true`` to enable encoder CUDA graphs.
+
 Example usage:
 python asr_streaming_infer.py \
         --config-path=../conf/asr_streaming_inference/ \
@@ -29,7 +31,6 @@ python asr_streaming_infer.py \
         audio_file=<path to audio file, directory of audio files, or manifest file> \
         output_filename=<path to output jsonfile> \
         lang=en \
-        enable_pnc=False \
         enable_itn=False \
         enable_nmt=False \
         asr_output_granularity=segment \
@@ -42,15 +43,20 @@ Note:
 """
 
 
-from time import time
-
 import hydra
 
 from nemo.collections.asr.inference.factory.pipeline_builder import PipelineBuilder
-from nemo.collections.asr.inference.utils.manifest_io import calculate_duration, dump_output, get_audio_filepaths
-from nemo.collections.asr.inference.utils.pipeline_eval import calculate_pipeline_laal, evaluate_pipeline
+
+from nemo.collections.asr.inference.utils.manifest_io import calculate_duration, dump_output, prepare_audio_data
+from nemo.collections.asr.inference.utils.pipeline_eval import (
+    calculate_asr_laal,
+    calculate_translation_laal,
+    evaluate_pipeline,
+)
 from nemo.collections.asr.inference.utils.progressbar import TQDMProgressBar
+
 from nemo.utils import logging
+from nemo.utils.timers import SimpleTimer
 
 # disable nemo_text_processing logging
 try:
@@ -68,9 +74,15 @@ def main(cfg):
 
     # Set the logging level
     logging.setLevel(cfg.log_level)
+    if cfg.run_steps < 1:
+        raise ValueError("run_steps must be at least 1")
 
     # Reading audio filepaths
-    audio_filepaths, manifest = get_audio_filepaths(cfg.audio_file, sort_by_duration=True)
+    audio_filepaths, manifest, options, filepath_order = prepare_audio_data(
+        cfg.audio_file,
+        per_stream_biasing_defaults=cfg.asr.get("per_stream_biasing_defaults", None),
+        sort_by_duration=True,
+    )
     logging.info(f"Found {len(audio_filepaths)} audio files")
     if manifest:
         keys = list(manifest[0].keys())
@@ -78,25 +90,51 @@ def main(cfg):
 
     # Build the pipeline
     pipeline = PipelineBuilder.build_pipeline(cfg)
-    progress_bar = TQDMProgressBar()
 
-    # Run the pipeline
-    start = time()
-    output = pipeline.run(audio_filepaths, progress_bar=progress_bar)
-    exec_dur = time() - start
+    # Warmup and run the pipeline
+    timer = SimpleTimer()
+    measurements = []
+    for run_step in range(cfg.warmup_steps + cfg.run_steps):
+        if run_step < cfg.warmup_steps:
+            logging.info(f"Running warmup step {run_step}")
+        else:
+            logging.info(f"Running inference step {run_step}")
+        progress_bar = TQDMProgressBar()
+        timer.reset()
+        timer.start(device=pipeline.device)
+        output = pipeline.run(audio_filepaths, progress_bar=progress_bar, options=options)
+        timer.stop(pipeline.device)
+        if run_step >= cfg.warmup_steps:
+            measurements.append(timer.total_sec())
 
-    # Calculate RTFX
+    # Calculate RTFx
+    if cfg.warmup_steps == 0:
+        logging.warning(
+            "RTFx measurement enabled, but warmup_steps=0. At least one warmup step is recommended to measure RTFx."
+        )
     data_dur, durations = calculate_duration(audio_filepaths)
+    exec_dur = sum(measurements) / len(measurements)
     rtfx = data_dur / exec_dur if exec_dur > 0 else float('inf')
-    logging.info(f"RTFX: {rtfx:.2f} ({data_dur:.2f}s / {exec_dur:.2f}s)")
+    logging.info(f"RTFx: {rtfx:.2f} ({data_dur:.2f}s / {exec_dur:.2f}s)")
 
-    # Calculate LAAL
-    laal = calculate_pipeline_laal(output, durations, manifest, cfg)
-    if laal is not None:
-        logging.info(f"LAAL: {laal:.2f}ms")
+    # Calculate ASR LAAL
+    asr_laal = calculate_asr_laal(output, durations, manifest, cfg)
+    if asr_laal is not None:
+        logging.info(f"ASR LAAL: {asr_laal:.2f}ms")
+
+    # Calculate Translation LAAL
+    st_laal = calculate_translation_laal(output, durations, manifest, cfg)
+    if st_laal is not None:
+        logging.info(f"ST LAAL: {st_laal:.2f}ms")
 
     # Dump the transcriptions to a output file
-    dump_output(output, cfg.output_filename, cfg.output_dir, manifest)
+    dump_output(
+        output=output,
+        output_filename=cfg.output_filename,
+        output_dir=cfg.output_dir,
+        manifest=manifest,
+        filepath_order=filepath_order,
+    )
 
     # Evaluate the pipeline
     evaluate_pipeline(cfg.output_filename, cfg)
