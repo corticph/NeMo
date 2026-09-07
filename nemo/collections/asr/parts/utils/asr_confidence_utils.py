@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class ConfidenceMethodConstants:
-    NAMES = ("max_prob", "entropy")
+    NAMES = ("max_prob", "entropy", "margin", "max_prob_raw", "top3_mass", "entropy_renyi_exp")
     ENTROPY_TYPES = ("gibbs", "tsallis", "renyi")
     ENTROPY_NORMS = ("lin", "exp")
 
@@ -55,6 +55,8 @@ class ConfidenceMethodConfig:
         name: The method name (str).
             Supported values:
                 - 'max_prob' for using the maximum token probability as a confidence.
+                - 'max_prob_raw' for the raw softmax probability (no V-normalization).
+                - 'margin' for the difference between top-2 probabilities (p_max - p_second).
                 - 'entropy' for using a normalized entropy of a log-likelihood vector.
 
         entropy_type: Which type of entropy to use (str).
@@ -236,6 +238,14 @@ def get_confidence_measure_bank():
         if t == 1.0
         else ((x.max(dim=-1)[0] * t).exp() * math.pow(v, t) - 1) / (math.pow(v, t) - 1)
     )
+    # margin: p_max - p_second (top-2 gap, no V-normalization)
+    confidence_measure_bank["margin"] = lambda x, v, t: (
+        x.topk(2, dim=-1)[0][..., 0].exp() - x.topk(2, dim=-1)[0][..., 1].exp()
+    )
+    # max_prob_raw: raw softmax probability (no V-normalization)
+    confidence_measure_bank["max_prob_raw"] = lambda x, v, t: (
+        x.max(dim=-1)[0].exp() if t == 1.0 else (x.max(dim=-1)[0] * t).exp()
+    )
     confidence_measure_bank["entropy_gibbs_lin"] = lambda x, v, t: (
         entropy_gibbs_lin_baseline(x, v)
         if t == 1.0
@@ -255,6 +265,16 @@ def get_confidence_measure_bank():
     )
     confidence_measure_bank["entropy_renyi_exp"] = lambda x, v, t: (
         entropy_gibbs_exp_baseline(x, v) if t == 1.0 else (neg_entropy_alpha(x, t).pow(1 / (t - 1)) * v - 1) / (v - 1)
+    )
+    # top3_mass: sum of top-3 softmax probabilities, in [0, 1]
+    confidence_measure_bank["top3_mass"] = lambda x, v, t: (torch.softmax(x * t, dim=-1).topk(3, dim=-1)[0].sum(-1))
+    # entropy: 1 - H(p)/log(V), normalized Shannon entropy confidence in [0, 1]
+    confidence_measure_bank["entropy"] = lambda x, v, t: (
+        1.0
+        + (torch.nn.functional.log_softmax(x * t, dim=-1).exp() * torch.nn.functional.log_softmax(x * t, dim=-1)).sum(
+            -1
+        )
+        / math.log(v)
     )
     return confidence_measure_bank
 
@@ -312,10 +332,16 @@ class ConfidenceMethodMixin(ABC):
         measure_name = ""
         if confidence_method_cfg.name == "max_prob":
             measure_name = "max_prob"
+        elif confidence_method_cfg.name == "max_prob_raw":
+            measure_name = "max_prob_raw"
+        elif confidence_method_cfg.name == "margin":
+            measure_name = "margin"
+        elif confidence_method_cfg.name == "top3_mass":
+            measure_name = "top3_mass"
         elif confidence_method_cfg.name == "entropy":
-            measure_name = '_'.join(
-                [confidence_method_cfg.name, confidence_method_cfg.entropy_type, confidence_method_cfg.entropy_norm]
-            )
+            measure_name = "entropy"
+        elif confidence_method_cfg.name == "entropy_renyi_exp":
+            measure_name = "entropy_renyi_exp"
         else:
             raise ValueError(f"Unsupported `confidence_method_cfg.name`: `{confidence_method_cfg.name}`")
         if measure_name not in self.confidence_measure_bank:
