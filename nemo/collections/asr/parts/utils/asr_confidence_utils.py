@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class ConfidenceMethodConstants:
-    NAMES = ("max_prob", "entropy", "margin", "max_prob_raw", "top3_mass")
+    NAMES = ("max_prob", "entropy", "margin", "max_prob_raw", "top3_mass", "entropy_renyi_exp")
     ENTROPY_TYPES = ("gibbs", "tsallis", "renyi")
     ENTROPY_NORMS = ("lin", "exp")
 
@@ -340,6 +340,8 @@ class ConfidenceMethodMixin(ABC):
             measure_name = "top3_mass"
         elif confidence_method_cfg.name == "entropy":
             measure_name = "entropy"
+        elif confidence_method_cfg.name == "entropy_renyi_exp":
+            measure_name = "entropy_renyi_exp"
         else:
             raise ValueError(f"Unsupported `confidence_method_cfg.name`: `{confidence_method_cfg.name}`")
         if measure_name not in self.confidence_measure_bank:
