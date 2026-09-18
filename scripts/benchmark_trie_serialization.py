@@ -18,18 +18,21 @@
 Answers the question: is it faster to serialize/deserialize a compiled boosting
 trie than to rebuild it from key phrases?
 
-Two serialization formats are benchmarked:
+Three serialization formats are benchmarked:
   1. state_dict + torch.save to BytesIO (lightweight, closest to a gRPC payload)
   2. .nemo file (tarball with state_dict + YAML config, the existing on-disk format)
+  3. direct multi-model (serialize tensors + metadata, deserialize directly into
+     GPUBiasingMultiModel's concatenated GPU buffers — no intermediate
+     GPUBoostingTreeModel created)
 
 For each format we measure:
   - Build time (baseline: from_config from phrases)
   - Serialize time + serialized size
-  - Deserialize time (reconstruct GPUBoostingTreeModel)
-  - Register time (add to GPUBiasingMultiModel on GPU)
+  - Deserialize time (reconstruct model or register to multi-model)
+  - Register time (add to GPUBiasingMultiModel on GPU, for formats 1-2)
   - Round-trip total (serialize + deserialize + register)
 
-Correctness verification: after deserialization, calls model.advance() on both
+Correctness verification: after deserialization, calls advance() on both
 the original and deserialized trie with the same random states, asserts the
 scores and next_states are identical.
 
@@ -228,6 +231,183 @@ def benchmark_register(model, device, vocab_size, iterations, warmup):
     return times
 
 
+def benchmark_serialize_direct(model, alpha, iterations, warmup):
+    buf = io.BytesIO()
+
+    def run():
+        buf.seek(0)
+        buf.truncate()
+        payload = {
+            "arcs_weights": model.arcs_weights.data[: model.num_arcs].clone(),
+            "from_states": model.from_states.data[: model.num_arcs].clone(),
+            "to_states": model.to_states.data[: model.num_arcs].clone(),
+            "ilabels": model.ilabels.data[: model.num_arcs].clone(),
+            "start_end_arcs": model.start_end_arcs.data[: model.num_states].clone(),
+            "state_order": model.state_order.data[: model.num_states].clone(),
+            "backoff_to_states": model.backoff_to_states.data[: model.num_states].clone(),
+            "backoff_weights": model.backoff_weights.data[: model.num_states].clone(),
+            "final_weights": model.final_weights.data[: model.num_states].clone(),
+            "alpha": alpha,
+            "num_states": model.num_states,
+            "num_arcs": model.num_arcs,
+            "num_arcs_extended": model.num_arcs_extended,
+            "bos_state": model.bos_state,
+        }
+        torch.save(payload, buf)
+
+    times = time_fn(run, iterations, warmup)
+    serialized = buf.getvalue()
+    return times, serialized
+
+
+def benchmark_deserialize_direct(serialized, device, vocab_size, alpha, iterations, warmup):
+    """Benchmark direct deserialization into GPUBiasingMultiModel (no intermediate GPUBoostingTreeModel)."""
+    biasing_multi_model = GPUBiasingMultiModel(vocab_size=vocab_size, use_triton=True)
+    biasing_multi_model.to(device)
+
+    def run():
+        buf = io.BytesIO(serialized)
+        payload = torch.load(buf, map_location="cpu", weights_only=True)
+
+        num_states = payload["num_states"]
+        num_arcs = payload["num_arcs"]
+        num_arcs_extended = payload["num_arcs_extended"]
+
+        if not biasing_multi_model._params_defined:
+            biasing_multi_model.bos_state = payload["bos_state"]
+            biasing_multi_model.float_dtype = payload["arcs_weights"].dtype
+            biasing_multi_model._params_defined = True
+
+        biasing_multi_model._maybe_extend_arcs_and_states(
+            add_num_states=num_states,
+            add_num_arcs_extended=num_arcs_extended,
+        )
+
+        if biasing_multi_model.free_ids:
+            model_id = biasing_multi_model.free_ids.pop()
+        else:
+            if biasing_multi_model.num_models >= biasing_multi_model.num_models_reserved:
+                biasing_multi_model._extend_num_models()
+            model_id = biasing_multi_model.num_models
+            biasing_multi_model.num_models += 1
+
+        states_start = biasing_multi_model.num_states_total
+        arcs_start = biasing_multi_model.num_arcs_extended_total
+
+        biasing_multi_model.model2alpha[model_id] = alpha
+        biasing_multi_model.model2active[model_id] = True
+        biasing_multi_model.model2num_states[model_id] = num_states
+        biasing_multi_model.model2num_arcs[model_id] = num_arcs
+        biasing_multi_model.model2num_arcs_extended[model_id] = num_arcs_extended
+        biasing_multi_model.model2states_offset[model_id] = states_start
+        biasing_multi_model.model2arcs_offset[model_id] = arcs_start
+
+        biasing_multi_model.all_arcs_weights.data[arcs_start : arcs_start + num_arcs].copy_(payload["arcs_weights"])
+        biasing_multi_model.all_from_states.data[arcs_start : arcs_start + num_arcs].copy_(payload["from_states"])
+        biasing_multi_model.all_to_states.data[arcs_start : arcs_start + num_arcs].copy_(payload["to_states"])
+        biasing_multi_model.all_ilabels.data[arcs_start : arcs_start + num_arcs].copy_(payload["ilabels"])
+        biasing_multi_model.all_start_end_arcs.data[states_start : states_start + num_states].copy_(payload["start_end_arcs"])
+        biasing_multi_model.all_state_order.data[states_start : states_start + num_states].copy_(payload["state_order"])
+        biasing_multi_model.all_backoff_to_states.data[states_start : states_start + num_states].copy_(payload["backoff_to_states"])
+        biasing_multi_model.all_backoff_weights.data[states_start : states_start + num_states].copy_(payload["backoff_weights"])
+        biasing_multi_model.all_final_weights.data[states_start : states_start + num_states].copy_(payload["final_weights"])
+
+        biasing_multi_model.num_states_total += num_states
+        biasing_multi_model.num_arcs_extended_total += num_arcs_extended
+
+        biasing_multi_model.remove_model(model_id)
+
+    times = time_fn(run, iterations, warmup, sync_cuda=(device.type == "cuda"))
+    return times
+
+
+def verify_correctness_direct(
+    original: GPUBoostingTreeModel,
+    serialized: bytes,
+    device: torch.device,
+    vocab_size: int,
+    alpha: float,
+):
+    """Verify that a directly-registered trie produces identical advance() results to the original.
+
+    Registers the deserialized bytes into a GPUBiasingMultiModel on GPU, then calls
+    advance() through the multi-model with model_ids and compares to the original
+    model's advance().
+    """
+    original = original.to(device)
+    original.eval()
+
+    biasing_multi_model = GPUBiasingMultiModel(vocab_size=vocab_size, use_triton=True)
+    biasing_multi_model.to(device)
+
+    buf = io.BytesIO(serialized)
+    payload = torch.load(buf, map_location="cpu", weights_only=True)
+
+    num_states = payload["num_states"]
+    num_arcs = payload["num_arcs"]
+    num_arcs_extended = payload["num_arcs_extended"]
+
+    if not biasing_multi_model._params_defined:
+        biasing_multi_model.bos_state = payload["bos_state"]
+        biasing_multi_model.float_dtype = payload["arcs_weights"].dtype
+        biasing_multi_model._params_defined = True
+
+    biasing_multi_model._maybe_extend_arcs_and_states(
+        add_num_states=num_states,
+        add_num_arcs_extended=num_arcs_extended,
+    )
+
+    model_id = biasing_multi_model.num_models
+    biasing_multi_model.num_models += 1
+
+    states_start = biasing_multi_model.num_states_total
+    arcs_start = biasing_multi_model.num_arcs_extended_total
+
+    biasing_multi_model.model2alpha[model_id] = alpha
+    biasing_multi_model.model2active[model_id] = True
+    biasing_multi_model.model2num_states[model_id] = num_states
+    biasing_multi_model.model2num_arcs[model_id] = num_arcs
+    biasing_multi_model.model2num_arcs_extended[model_id] = num_arcs_extended
+    biasing_multi_model.model2states_offset[model_id] = states_start
+    biasing_multi_model.model2arcs_offset[model_id] = arcs_start
+
+    biasing_multi_model.all_arcs_weights.data[arcs_start : arcs_start + num_arcs].copy_(payload["arcs_weights"])
+    biasing_multi_model.all_from_states.data[arcs_start : arcs_start + num_arcs].copy_(payload["from_states"])
+    biasing_multi_model.all_to_states.data[arcs_start : arcs_start + num_arcs].copy_(payload["to_states"])
+    biasing_multi_model.all_ilabels.data[arcs_start : arcs_start + num_arcs].copy_(payload["ilabels"])
+    biasing_multi_model.all_start_end_arcs.data[states_start : states_start + num_states].copy_(payload["start_end_arcs"])
+    biasing_multi_model.all_state_order.data[states_start : states_start + num_states].copy_(payload["state_order"])
+    biasing_multi_model.all_backoff_to_states.data[states_start : states_start + num_states].copy_(payload["backoff_to_states"])
+    biasing_multi_model.all_backoff_weights.data[states_start : states_start + num_states].copy_(payload["backoff_weights"])
+    biasing_multi_model.all_final_weights.data[states_start : states_start + num_states].copy_(payload["final_weights"])
+
+    biasing_multi_model.num_states_total += num_states
+    biasing_multi_model.num_arcs_extended_total += num_arcs_extended
+
+    batch_size = 128
+    states = torch.full([batch_size], fill_value=0, dtype=torch.long, device=device)
+    model_ids = torch.full([batch_size], fill_value=model_id, dtype=torch.long, device=device)
+
+    with torch.no_grad(), torch.inference_mode():
+        scores_orig, next_states_orig = original.advance(states)
+        scores_mm, next_states_mm = biasing_multi_model.advance(states, model_ids=model_ids)
+
+    # The multi-model applies alpha scaling: scores *= model2alpha[model_ids]
+    # The standalone model does not, so we apply it here for comparison.
+    scores_orig = scores_orig * alpha
+
+    scores_match = torch.allclose(scores_orig, scores_mm, atol=1e-6, rtol=1e-5)
+    states_match = torch.equal(next_states_orig, next_states_mm)
+
+    if not scores_match:
+        max_diff = (scores_orig - scores_mm).abs().max().item()
+        return False, f"Scores mismatch: max diff = {max_diff}"
+    if not states_match:
+        mismatches = (next_states_orig != next_states_mm).sum().item()
+        return False, f"Next-states mismatch: {mismatches}/{batch_size * vocab_size}"
+    return True, "Scores and next_states identical (via multi-model advance)"
+
+
 def verify_correctness(original: GPUBoostingTreeModel, deserialized: GPUBoostingTreeModel, device: torch.device):
     original = original.to(device)
     deserialized = deserialized.to(device)
@@ -267,11 +447,14 @@ class TermResult:
     build: StageResult = field(default_factory=StageResult)
     ser_sd: StageResult = field(default_factory=StageResult)
     ser_nemo: StageResult = field(default_factory=StageResult)
+    ser_direct: StageResult = field(default_factory=StageResult)
     deser_sd: StageResult = field(default_factory=StageResult)
     deser_nemo: StageResult = field(default_factory=StageResult)
+    deser_direct: StageResult = field(default_factory=StageResult)
     register: StageResult = field(default_factory=StageResult)
     correctness_sd: str = ""
     correctness_nemo: str = ""
+    correctness_direct: str = ""
 
 
 def print_results_table(
@@ -323,8 +506,10 @@ def print_results_table(
         print_stage(r.build, build_med)
         print_stage(r.ser_sd, build_med)
         print_stage(r.ser_nemo, build_med)
+        print_stage(r.ser_direct, build_med)
         print_stage(r.deser_sd, build_med)
         print_stage(r.deser_nemo, build_med)
+        print_stage(r.deser_direct, build_med)
         print_stage(r.register, build_med)
 
         rt_sd_med = (
@@ -337,21 +522,29 @@ def print_results_table(
             if r.ser_nemo.times and r.deser_nemo.times and r.register.times
             else 0.0
         )
+        rt_direct_med = (
+            statistics.median(r.ser_direct.times) + statistics.median(r.deser_direct.times)
+            if r.ser_direct.times and r.deser_direct.times
+            else 0.0
+        )
 
         print()
-        print(f"    Round-trip (state_dict):  {format_duration(rt_sd_med):>10}  "
+        print(f"    Round-trip (state_dict):   {format_duration(rt_sd_med):>10}  "
               f"({rt_sd_med / build_med:>6.3f}x of build)" if build_med > 0 else "")
-        print(f"    Round-trip (.nemo):       {format_duration(rt_nemo_med):>10}  "
+        print(f"    Round-trip (.nemo):        {format_duration(rt_nemo_med):>10}  "
               f"({rt_nemo_med / build_med:>6.3f}x of build)" if build_med > 0 else "")
+        print(f"    Round-trip (direct):       {format_duration(rt_direct_med):>10}  "
+              f"({rt_direct_med / build_med:>6.3f}x of build)" if build_med > 0 else "")
         print()
-        print(f"    Correctness (state_dict): {r.correctness_sd}")
+        print(f"    Correctness (state_dict):  {r.correctness_sd}")
         print(f"    Correctness (.nemo):       {r.correctness_nemo}")
+        print(f"    Correctness (direct):      {r.correctness_direct}")
         print()
         print("    " + "=" * 125)
 
     print()
     print("Summary: round-trip / build ratio at each term count")
-    print("    " + "-" * 60)
+    print("    " + "-" * 80)
     for r in results:
         build_med = statistics.median(r.build.times) if r.build.times else 0.0
         rt_sd = (
@@ -362,10 +555,19 @@ def print_results_table(
             statistics.median(r.ser_nemo.times) + statistics.median(r.deser_nemo.times) + statistics.median(r.register.times)
             if r.ser_nemo.times and r.deser_nemo.times and r.register.times else 0.0
         )
+        rt_direct = (
+            statistics.median(r.ser_direct.times) + statistics.median(r.deser_direct.times)
+            if r.ser_direct.times and r.deser_direct.times else 0.0
+        )
         ratio_sd = rt_sd / build_med if build_med > 0 else 0.0
         ratio_nemo = rt_nemo / build_med if build_med > 0 else 0.0
-        print(f"    {r.num_terms:>6} terms  state_dict={ratio_sd:.3f}x  .nemo={ratio_nemo:.3f}x  "
-              f"build={format_duration(build_med)}  rt_sd={format_duration(rt_sd)}  rt_nemo={format_duration(rt_nemo)}")
+        ratio_direct = rt_direct / build_med if build_med > 0 else 0.0
+        print(
+            f"    {r.num_terms:>6} terms  "
+            f"state_dict={ratio_sd:.3f}x  .nemo={ratio_nemo:.3f}x  direct={ratio_direct:.3f}x  |  "
+            f"build={format_duration(build_med)}  "
+            f"rt_sd={format_duration(rt_sd)}  rt_nemo={format_duration(rt_nemo)}  rt_direct={format_duration(rt_direct)}"
+        )
     print("=" * 130)
 
 
@@ -375,6 +577,7 @@ def parse_args():
     parser.add_argument("--term-counts", type=str, default="100,1000,5000,10000")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--alpha", type=float, default=2.0, help="Boosting model alpha weight")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -465,7 +668,29 @@ def main():
             result.deser_nemo = StageResult(name="deserialize (.nemo)", times=deser_nemo_times)
             print(f"    median: {format_duration(statistics.median(deser_nemo_times))}")
 
-            # 6. Register to GPUBiasingMultiModel
+            # 6. Serialize (direct)
+            print(f"  Benchmarking serialize (direct)...")
+            ser_direct_times, ser_direct_bytes = benchmark_serialize_direct(
+                built_model, alpha=args.alpha,
+                iterations=args.iterations, warmup=args.warmup,
+            )
+            result.ser_direct = StageResult(
+                name="serialize (direct)", times=ser_direct_times, size_bytes=len(ser_direct_bytes),
+            )
+            print(f"    median: {format_duration(statistics.median(ser_direct_times))}, "
+                  f"size: {format_size(len(ser_direct_bytes))}")
+
+            # 7. Deserialize (direct) — directly into GPUBiasingMultiModel
+            print(f"  Benchmarking deserialize (direct into multi-model)...")
+            deser_direct_times = benchmark_deserialize_direct(
+                ser_direct_bytes, device, vocab_size,
+                alpha=args.alpha,
+                iterations=args.iterations, warmup=args.warmup,
+            )
+            result.deser_direct = StageResult(name="deserialize (direct)", times=deser_direct_times)
+            print(f"    median: {format_duration(statistics.median(deser_direct_times))}")
+
+            # 8. Register to GPUBiasingMultiModel (for state_dict and .nemo paths)
             print(f"  Benchmarking register to multi-model...")
             deser_model = create_model_from_metadata(metadata)
             buf = io.BytesIO(ser_sd_bytes)
@@ -484,12 +709,20 @@ def main():
             result.correctness_sd = f"{'PASS' if ok else 'FAIL'}: {detail}"
             print(f"    {result.correctness_sd}")
 
-            # 8. Correctness verification (.nemo)
+            # 10. Correctness verification (.nemo)
             print(f"  Verifying correctness (.nemo)...")
             nemo_model = GPUBoostingTreeModel.from_nemo(lm_path=nemo_path, vocab_size=vocab_size)
             ok_nemo, detail_nemo = verify_correctness(built_model, nemo_model, device)
             result.correctness_nemo = f"{'PASS' if ok_nemo else 'FAIL'}: {detail_nemo}"
             print(f"    {result.correctness_nemo}")
+
+            # 11. Correctness verification (direct)
+            print(f"  Verifying correctness (direct)...")
+            ok_direct, detail_direct = verify_correctness_direct(
+                built_model, ser_direct_bytes, device, vocab_size, alpha=args.alpha,
+            )
+            result.correctness_direct = f"{'PASS' if ok_direct else 'FAIL'}: {detail_direct}"
+            print(f"    {result.correctness_direct}")
 
             print()
             all_results.append(result)
