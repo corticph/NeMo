@@ -518,21 +518,22 @@ def benchmark_scaled_batch(
     term_count: int,
     beam_size: int,
     session_counts: list[int],
+    pad_to_duration: float | None = None,
     hf_cache_dir: str = "/mnt/md0/mlrd/shared_cache/huggingface",
 ):
     """Scale batch_size = n_sessions and measure RTFx to find the realtime limit.
 
-    Each session sends audio simultaneously. We decode all N sessions in one batch.
-    RTFx = total_audio_duration / decode_time. When RTFx < 1.0, we've exceeded
-    the realtime capacity of the GPU.
+    Each session sends audio simultaneously. We run the full pipeline (encode +
+    decode) for all N sessions in one batch. RTFx = total_audio_duration /
+    pipeline_time. When RTFx < 1.0, we've exceeded the realtime capacity of the
+    GPU.
     """
-    import os
-
-    from datasets import load_dataset
-
-    print("\n=== Test 3: Scaled Batch (batch_size = n_sessions) ===")
+    print("\n=== Test 3: Scaled Batch (batch_size = n_sessions, full pipeline) ===")
     print(f"  Beam size: {beam_size}")
-    print(f"  Audio: LibriSpeech test.clean (real speech)")
+    if pad_to_duration:
+        print(f"  Audio: LibriSpeech test.clean padded to {pad_to_duration}s")
+    else:
+        print(f"  Audio: LibriSpeech test.clean (real speech)")
     print(f"  Constraint: RTFx must stay >= 1.0 for realtime serving")
     print(f"  Session counts to test: {session_counts}")
     print()
@@ -541,15 +542,8 @@ def benchmark_scaled_batch(
     model.preprocessor.featurizer.dither = 0.0
     model.preprocessor.featurizer.pad_to = 0
 
-    ds = load_dataset(
-        "openslr/librispeech_asr",
-        "clean",
-        split="test",
-        cache_dir=os.path.join(hf_cache_dir, "datasets"),
-    )
-
     max_needed = max(session_counts) if session_counts else 0
-    if max_needed > num_tries:
+    if biasing_multi_model is not None and max_needed > num_tries:
         print(f"  Note: max session count ({max_needed}) > registered tries ({num_tries})")
         print(f"  Sessions beyond {num_tries} will use multi_biasing_ids=-1 (no biasing)")
     print()
@@ -559,67 +553,73 @@ def benchmark_scaled_batch(
     for n_sessions in session_counts:
         print(f"  {n_sessions:>4} sessions (batch={n_sessions}): ", end="", flush=True)
 
-        samples = []
-        for i in range(n_sessions):
-            row = ds[i]
-            audio = torch.tensor(row["audio"]["array"], dtype=torch.float32)
-            sr = row["audio"]["sampling_rate"]
-            if sr != 16000:
-                import torchaudio
-
-                audio = torchaudio.functional.resample(audio, sr, 16000)
-            samples.append(audio)
-
-        max_len = max(s.shape[0] for s in samples)
-        audio_batch = torch.zeros(n_sessions, max_len, dtype=torch.float32, device=device)
-        audio_len = torch.zeros(n_sessions, dtype=torch.long, device=device)
-        for i, s in enumerate(samples):
-            audio_batch[i, : s.shape[0]] = s.to(device)
-            audio_len[i] = s.shape[0]
+        audio_batch, audio_len, _ = load_librispeech_batch(
+            n_sessions, device, hf_cache_dir=hf_cache_dir, pad_to_duration=pad_to_duration
+        )
 
         total_audio_s = audio_len.float().sum().item() / 16000
 
         try:
-            with torch.no_grad(), torch.inference_mode():
-                encoded, encoded_len = model(input_signal=audio_batch, input_signal_length=audio_len)
+            if biasing_multi_model is not None:
+                multi_biasing_ids = torch.arange(min(n_sessions, num_tries), dtype=torch.long, device=device)
+                if n_sessions > num_tries:
+                    multi_biasing_ids = torch.cat([
+                        multi_biasing_ids,
+                        torch.full([n_sessions - num_tries], fill_value=-1, dtype=torch.long, device=device),
+                    ])
+                decoder = make_beam_decoder(model, biasing_multi_model, beam_size=beam_size)
+            else:
+                multi_biasing_ids = None
+                model_cfg = model.to_config_dict()
+                durations = list(model_cfg["model_defaults"]["tdt_durations"])
+                vocab_size = model.tokenizer.vocab_size
+                decoder = BeamBatchedTDTInfer(
+                    decoder_model=model.decoder,
+                    joint_model=model.joint,
+                    durations=durations,
+                    blank_index=vocab_size,
+                    beam_size=beam_size,
+                    score_norm=True,
+                    return_best_hypothesis=True,
+                    allow_cuda_graphs=False,
+                    enable_per_stream_biasing=False,
+                )
 
-            multi_biasing_ids = torch.arange(min(n_sessions, num_tries), dtype=torch.long, device=device)
-            if n_sessions > num_tries:
-                multi_biasing_ids = torch.cat([
-                    multi_biasing_ids,
-                    torch.full([n_sessions - num_tries], fill_value=-1, dtype=torch.long, device=device),
-                ])
-
-            decoder = make_beam_decoder(model, biasing_multi_model, beam_size=beam_size)
-
-            def run_decode():
+            def run_pipeline():
                 with torch.no_grad(), torch.inference_mode():
-                    hyps = decoder(
-                        encoder_output=encoded,
-                        encoded_lengths=encoded_len,
-                        multi_biasing_ids=multi_biasing_ids,
-                    )[0]
+                    encoded, encoded_len = model(input_signal=audio_batch, input_signal_length=audio_len)
+                    if multi_biasing_ids is not None:
+                        hyps = decoder(
+                            encoder_output=encoded,
+                            encoded_lengths=encoded_len,
+                            multi_biasing_ids=multi_biasing_ids,
+                        )[0]
+                    else:
+                        hyps = decoder(
+                            encoder_output=encoded,
+                            encoded_lengths=encoded_len,
+                        )[0]
                 return hyps
 
-            run_decode()
+            run_pipeline()
             torch.cuda.synchronize(device)
             t0 = time.perf_counter()
-            run_decode()
+            run_pipeline()
             torch.cuda.synchronize(device)
             t1 = time.perf_counter()
-            decode_time = t1 - t0
-            rtfx = total_audio_s / decode_time if decode_time > 0 else 0.0
+            pipeline_time = t1 - t0
+            rtfx = total_audio_s / pipeline_time if pipeline_time > 0 else 0.0
 
             peak_mem = torch.cuda.max_memory_allocated(device) / (1024**3)
             torch.cuda.reset_peak_memory_stats(device)
 
             status = "OK" if rtfx >= 1.0 else "BELOW REALTIME"
-            print(f"decode={decode_time * 1000:.0f}ms, RTFx={rtfx:.1f}x, peak={peak_mem:.2f} GB [{status}]")
+            print(f"pipeline={pipeline_time * 1000:.0f}ms, RTFx={rtfx:.1f}x, peak={peak_mem:.2f} GB [{status}]")
 
             results.append({
                 "sessions": n_sessions,
                 "batch_size": n_sessions,
-                "decode_time_ms": decode_time * 1000,
+                "pipeline_time_ms": pipeline_time * 1000,
                 "total_audio_s": total_audio_s,
                 "rtfx": rtfx,
                 "peak_mem_gb": peak_mem,
@@ -639,7 +639,7 @@ def benchmark_scaled_batch(
             results.append({
                 "sessions": n_sessions,
                 "batch_size": n_sessions,
-                "decode_time_ms": None,
+                "pipeline_time_ms": None,
                 "total_audio_s": total_audio_s,
                 "rtfx": 0.0,
                 "peak_mem_gb": None,
@@ -702,15 +702,15 @@ def print_summary(
 
     if scaled_results:
         print()
-        print("Scaled Batch (batch_size = n_sessions, all sessions decode simultaneously):")
-        print(f"  {'Sessions':>8}  {'Batch':>6}  {'Decode Time':>12}  {'Total Audio':>12}  {'RTFx':>8}  {'Peak Mem':>10}  {'Status'}")
-        print(f"  {'-'*8}  {'-'*6}  {'-'*12}  {'-'*12}  {'-'*8}  {'-'*10}  {'-'*20}")
+        print("Scaled Batch (batch_size = n_sessions, full pipeline encode+decode):")
+        print(f"  {'Sessions':>8}  {'Batch':>6}  {'Pipeline Time':>14}  {'Total Audio':>12}  {'RTFx':>8}  {'Peak Mem':>10}  {'Status'}")
+        print(f"  {'-'*8}  {'-'*6}  {'-'*14}  {'-'*12}  {'-'*8}  {'-'*10}  {'-'*20}")
         for r in scaled_results:
-            dt = f"{r['decode_time_ms']:.0f}ms" if r["decode_time_ms"] else "OOM"
+            dt = f"{r['pipeline_time_ms']:.0f}ms" if r["pipeline_time_ms"] else "OOM"
             ta = f"{r['total_audio_s']:.1f}s"
             pm = f"{r['peak_mem_gb']:.2f}GB" if r["peak_mem_gb"] else "--"
             status = "REALTIME" if r["realtime"] else "BELOW REALTIME"
-            print(f"  {r['sessions']:>8}  {r['batch_size']:>6}  {dt:>12}  {ta:>12}  {r['rtfx']:>7.1f}x  {pm:>10}  {status}")
+            print(f"  {r['sessions']:>8}  {r['batch_size']:>6}  {dt:>14}  {ta:>12}  {r['rtfx']:>7.1f}x  {pm:>10}  {status}")
 
         realtime_max = max((r["sessions"] for r in scaled_results if r["realtime"]), default=0)
         print(f"  Max realtime sessions: {realtime_max}")
@@ -794,6 +794,12 @@ def parse_args():
         default=50000,
         help="Maximum terms per trie when --variable-trie-sizes is set",
     )
+    parser.add_argument(
+        "--no-biasing",
+        action="store_true",
+        help="Skip all biasing infrastructure entirely (no GPUBiasingMultiModel, no tries). "
+        "Runs scaled batch test with a plain decoder. Requires --scale-batch.",
+    )
     return parser.parse_args()
 
 
@@ -826,6 +832,8 @@ def main():
         print(f"  Decode session counts: {decode_counts}")
     if args.variable_trie_sizes:
         print(f"  Variable trie sizes: {args.min_terms}-{args.max_terms} terms per trie (random)")
+    if args.no_biasing:
+        print(f"  No biasing: skipping verify, memory capacity, and decode tests")
     if args.scale_batch:
         scale_counts = [int(x.strip()) for x in args.scale_batch_counts.split(",")]
         print(f"  Scale batch test: enabled, counts: {scale_counts}")
@@ -840,37 +848,41 @@ def main():
     print(f"Tokenizer: {type(tokenizer).__name__}, vocab_size={vocab_size}")
     print()
 
-    biasing_ok = verify_biasing(model, tokenizer, vocab_size, device, args.beam_size)
-    if not biasing_ok:
-        print("  WARNING: Biasing did not change the output. Results may not reflect real biasing behavior.")
-    print()
-
-    mem_results, biasing_multi_model = benchmark_memory_capacity(
-        model, tokenizer, vocab_size, device,
-        term_count=args.term_count,
-        max_sessions=args.max_sessions,
-        step_sizes=session_steps,
-        variable_trie_sizes=args.variable_trie_sizes,
-        min_terms=args.min_terms,
-        max_terms=args.max_terms,
-    )
-
+    mem_results = []
     decode_results = []
-    if not args.no_decode_test:
-        actual_decode_counts = [c for c in decode_counts if c <= args.max_sessions]
-        if 0 not in actual_decode_counts:
-            actual_decode_counts = [0] + actual_decode_counts
+    biasing_multi_model = None
 
-        decode_results = benchmark_decode_performance(
+    if not args.no_biasing:
+        biasing_ok = verify_biasing(model, tokenizer, vocab_size, device, args.beam_size)
+        if not biasing_ok:
+            print("  WARNING: Biasing did not change the output. Results may not reflect real biasing behavior.")
+        print()
+
+        mem_results, biasing_multi_model = benchmark_memory_capacity(
             model, tokenizer, vocab_size, device,
-            biasing_multi_model=biasing_multi_model,
-            num_tries=args.max_sessions,
             term_count=args.term_count,
-            batch_size=args.batch_size,
-            beam_size=args.beam_size,
-            session_counts=actual_decode_counts,
-            pad_to_duration=args.pad_to_duration,
+            max_sessions=args.max_sessions,
+            step_sizes=session_steps,
+            variable_trie_sizes=args.variable_trie_sizes,
+            min_terms=args.min_terms,
+            max_terms=args.max_terms,
         )
+
+        if not args.no_decode_test:
+            actual_decode_counts = [c for c in decode_counts if c <= args.max_sessions]
+            if 0 not in actual_decode_counts:
+                actual_decode_counts = [0] + actual_decode_counts
+
+            decode_results = benchmark_decode_performance(
+                model, tokenizer, vocab_size, device,
+                biasing_multi_model=biasing_multi_model,
+                num_tries=args.max_sessions,
+                term_count=args.term_count,
+                batch_size=args.batch_size,
+                beam_size=args.beam_size,
+                session_counts=actual_decode_counts,
+                pad_to_duration=args.pad_to_duration,
+            )
 
     scaled_results = []
     if args.scale_batch:
@@ -882,6 +894,7 @@ def main():
             term_count=args.term_count,
             beam_size=args.beam_size,
             session_counts=scale_counts,
+            pad_to_duration=args.pad_to_duration,
         )
 
     print_summary(
