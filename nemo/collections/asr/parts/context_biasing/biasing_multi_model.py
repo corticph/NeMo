@@ -644,6 +644,8 @@ class GPUBiasingMultiModel(GPUBiasingMultiModelBase):
         """
         batch_size = states.shape[0]
         device = states.device
+        states = states.contiguous()
+        model_ids = model_ids.contiguous()
         scores = torch.zeros([batch_size, self.vocab_size], device=device, dtype=self.all_arcs_weights.dtype)
         next_states = torch.full([batch_size, self.vocab_size], fill_value=-1, dtype=torch.long, device=device)
 
